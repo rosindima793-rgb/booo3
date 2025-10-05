@@ -81,7 +81,8 @@ function createNonceManager(wallet) {
   return {
     async init() {
       if (!nextNoncePromise) {
-        nextNoncePromise = wallet.getTransactionCount('pending');
+        // Use provider to fetch pending nonce for the wallet address
+        nextNoncePromise = provider.getTransactionCount(await wallet.getAddress(), 'pending');
       }
       return nextNoncePromise;
     },
@@ -90,8 +91,9 @@ function createNonceManager(wallet) {
         await this.init();
       }
       const base = await nextNoncePromise;
-      nextNoncePromise = Promise.resolve(base + 1n);
-      return base;
+      // ensure nextNoncePromise is a Promise<number>
+      nextNoncePromise = Promise.resolve(Number(base) + 1);
+      return Number(base);
     }
   };
 }
