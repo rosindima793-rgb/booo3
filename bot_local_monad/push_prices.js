@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * CrazyOctagon Smart Bot
+ * CrazyOctagon Smart Bot (REWRITTEN)
  * - Anti-dump push logic (rise→instant, fall→delay+stability)
  * - Random buy/sell trading (7 buy variants, 6 sell variants)
  * - PancakeSwap only price source
+ * - FIXED: strict sequential TX queue with centralized nonce tracker
  */
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
@@ -12,8 +13,6 @@ const fs = require('fs');
 const { ethers } = require('ethers');
 
 // ===== CONFIG =====
-// Public contract addresses hardcoded (as requested).
-// Secrets (private keys) are still read from env only.
 const RPC_URL = 'https://testnet-rpc.monad.xyz';
 const NFT_COLLECTION = '0x4bcd4aff190d715fa7201cce2e69dd72c0549b07'.toLowerCase();
 const CRAA_TOKEN = '0x7D7F4BDd43292f9E7Aae44707a7EEEB5655ca465'.toLowerCase();
@@ -26,7 +25,6 @@ const RES_BASE = 'https://api-monad-testnet.reservoir.tools';
 const CORE_PROXY = '0xb8Fee974031de01411656F908E13De4Ad9c74A9B'.toLowerCase();
 const ROUTER = '0x3a3eBAe0Eec80852FBC7B9E824C6756969cc8dc1'.toLowerCase();
 
-// Debug: print resolved runtime config for quick diagnosis in Actions logs
 console.log('DEBUG: NFT_COLLECTION=', NFT_COLLECTION);
 console.log('DEBUG: RPC_URL=', RPC_URL);
 
@@ -58,6 +56,16 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const statePath = path.join(__dirname, '..', 'data', 'bot_state.json');
 const errPath = path.join(__dirname, '..', 'data', 'error_state.json');
 
+// Rate limiting: randomized delay between RPC calls
+const RATE_LIMIT_MIN_MS = parseInt(process.env.RATE_LIMIT_MIN_MS || '500', 10);
+const RATE_LIMIT_MAX_MS = parseInt(process.env.RATE_LIMIT_MAX_MS || '1200', 10);
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function randomDelay() {
+  const min = Math.min(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS);
+  const max = Math.max(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS);
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
 // Simple retry helper with exponential backoff
 async function retryAsync(fn, attempts = 3, baseDelay = 500) {
   let lastErr;
@@ -74,37 +82,87 @@ async function retryAsync(fn, attempts = 3, baseDelay = 500) {
   throw lastErr;
 }
 
-// Simple in-memory nonce manager (per wallet) to serialize nonces within this process.
-// Not a cross-process lock; prevents nonce races for sequential txs sent from the same Node process.
-function createNonceManager(wallet) {
-  let nextNoncePromise = null;
-  return {
-    async init() {
-      if (!nextNoncePromise) {
-        // Use provider to fetch pending nonce for the wallet address
-        nextNoncePromise = provider.getTransactionCount(await wallet.getAddress(), 'pending');
-      }
-      return nextNoncePromise;
-    },
-    async take() {
-      if (!nextNoncePromise) {
-        await this.init();
-      }
-      const base = await nextNoncePromise;
-      // ensure nextNoncePromise is a Promise<number>
-      nextNoncePromise = Promise.resolve(Number(base) + 1);
-      return Number(base);
+// ===== CENTRALIZED TX QUEUE (strict sequential, single nonce tracker per wallet) =====
+class TxQueue {
+  constructor(wallet, provider) {
+    this.wallet = wallet;
+    this.provider = provider;
+    this.queue = [];
+    this.processing = false;
+    this.currentNonce = null; // will be fetched on first use
+  }
+
+  async init() {
+    if (this.currentNonce === null) {
+      const addr = await this.wallet.getAddress();
+      this.currentNonce = await this.provider.getTransactionCount(addr, 'pending');
+      console.log(`TxQueue initialized for ${addr}, starting nonce: ${this.currentNonce}`);
     }
-  };
+  }
+
+  async enqueue(txFn, description = 'tx') {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ txFn, description, resolve, reject });
+      this._process();
+    });
+  }
+
+  async _process() {
+    if (this.processing || this.queue.length === 0) return;
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      const { txFn, description, resolve, reject } = this.queue.shift();
+      try {
+        await this.init(); // ensure nonce is fetched
+        const nonce = this.currentNonce;
+        console.log(`  [TxQueue] Sending ${description} with nonce ${nonce}...`);
+        
+        // Execute tx function (should return a tx request or call a contract method)
+        await sleep(randomDelay()); // rate-limit delay
+        const tx = await txFn(nonce);
+        
+        // Wait for confirmation (with timeout)
+        try {
+          await this.provider.waitForTransaction(tx.hash, 1, 120000); // 2 min timeout
+          console.log(`  [TxQueue] ✅ ${description} confirmed: ${tx.hash}`);
+        } catch (waitErr) {
+          console.warn(`  [TxQueue] waitForTransaction warning for ${description}:`, waitErr && waitErr.message ? waitErr.message : String(waitErr));
+        }
+        
+        // Increment nonce for next tx
+        this.currentNonce += 1;
+        resolve(tx);
+      } catch (err) {
+        console.error(`  [TxQueue] ❌ ${description} failed:`, err && err.message ? err.message : String(err));
+        // Do NOT increment nonce on failure — will retry with same nonce or let user handle
+        reject(err);
+      }
+    }
+
+    this.processing = false;
+  }
 }
 
-// Rate limiting: randomized small delay between external calls to avoid RPC throttling
-// Bumped defaults to reduce QuickNode / provider throttling (can be tuned via env)
-const RATE_LIMIT_MIN_MS = parseInt(process.env.RATE_LIMIT_MIN_MS || '500', 10);
-const RATE_LIMIT_MAX_MS = parseInt(process.env.RATE_LIMIT_MAX_MS || '1200', 10);
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function randomDelay() { return Math.floor(Math.random() * (Math.max(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS) - Math.min(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS) + 1)) + Math.min(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS); }
+// Global TX queues (one per wallet/private key)
+let oracleQueue = null;
+let traderQueue = null;
 
+function getOracleQueue() {
+  if (!oracleQueue && ORACLE_PK) {
+    const wallet = new ethers.Wallet(ORACLE_PK, provider);
+    oracleQueue = new TxQueue(wallet, provider);
+  }
+  return oracleQueue;
+}
+
+function getTraderQueue() {
+  if (!traderQueue && TRADER_PK) {
+    const wallet = new ethers.Wallet(TRADER_PK, provider);
+    traderQueue = new TxQueue(wallet, provider);
+  }
+  return traderQueue;
+}
 
 function isValidAddress(a){ return typeof a === 'string' && /^0x[a-fA-F0-9]{40}$/.test(a); }
 function randomChoice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
@@ -142,7 +200,6 @@ function recordError() {
   const s = readErrorState();
   s.consecutive = (s.consecutive || 0) + 1;
   s.lastErrorAt = Date.now();
-  // if too many consecutive errors, set stop cooldown (1 hour)
   if (s.consecutive >= 3) {
     s.stoppedUntil = Date.now() + 60 * 60 * 1000; // 1 hour
     console.error('‼️ Too many consecutive errors — stopping until', new Date(s.stoppedUntil).toISOString());
@@ -158,7 +215,6 @@ function shouldStopForErrors() {
   const s = readErrorState();
   if (!s || !s.stoppedUntil) return false;
   if (Date.now() < s.stoppedUntil) return true;
-  // cooldown passed — reset
   clearErrors();
   return false;
 }
@@ -178,22 +234,19 @@ async function findPancakePair(tokenAddr) {
   }
 
   const pair = rawPair.toLowerCase();
-  // Validate that the pair address actually implements expected pair methods.
   try {
     console.log(`Factory returned pair address for token ${tokenAddr}: ${pair}`);
-  await sleep(randomDelay());
-  const code = await retryAsync(() => provider.getCode(pair));
+    await sleep(randomDelay());
+    const code = await retryAsync(() => provider.getCode(pair));
     console.log(`Pair code size (hex): ${code.length} for ${pair}`);
     if (!code || code === '0x') {
       throw new Error(`No contract code at pair address ${pair}`);
     }
     const pairContract = new ethers.Contract(pair, ['function token0() view returns (address)'], provider);
-    // call token0() to confirm the contract behaves like a UniswapV2 pair
-  await sleep(randomDelay());
-  await retryAsync(() => pairContract.token0());
+    await sleep(randomDelay());
+    await retryAsync(() => pairContract.token0());
     return pair;
   } catch (err) {
-    // invalid pair address / non-pair contract — log and try fallback pools
     console.error(`Pair at ${pair} failed token0() call:`, err?.message ?? String(err));
     if (tokenAddr === CRAA_TOKEN && CRAA_WMON_POOL) return CRAA_WMON_POOL;
     if (tokenAddr === OCTA_TOKEN && OCTA_WMON_POOL) return OCTA_WMON_POOL;
@@ -234,8 +287,8 @@ async function priceTokenInMON(pairAddr, tokenAddr) {
     denominator *= 10n ** (-diff);
   }
 
-  const priceScaled = numerator * SCALE / denominator; // token price in WMON (1e18 scale)
-  const tokensPerOtherScaled = denominator * SCALE / numerator; // tokens per 1 WMON (1e18 scale)
+  const priceScaled = numerator * SCALE / denominator;
+  const tokensPerOtherScaled = denominator * SCALE / numerator;
 
   return {
     priceScaled,
@@ -250,8 +303,8 @@ async function priceTokenInMON(pairAddr, tokenAddr) {
 async function fetchFloorMON() {
   const url = `${RES_BASE}/stats/v2?collection=${NFT_COLLECTION}`;
   try {
-  await sleep(randomDelay());
-  const { data } = await retryAsync(() => axios.get(url, { timeout: 15000 }));
+    await sleep(randomDelay());
+    const { data } = await retryAsync(() => axios.get(url, { timeout: 15000 }));
     const native = data?.stats?.market?.floorAsk?.value?.native || data?.stats?.floor?.native;
     if (native && typeof native === 'number') return native;
   } catch (e) { /* ignore */ }
@@ -315,7 +368,7 @@ async function fetchPrices() {
   };
 }
 
-// ===== PUSH TO CONTRACT =====
+// ===== PUSH TO CONTRACT (using TxQueue) =====
 async function pushToContract(prices, dryRun = true) {
   if (!ORACLE_PK) {
     console.log('⚠️  No ORACLE_PK - skipping push');
@@ -327,18 +380,15 @@ async function pushToContract(prices, dryRun = true) {
     return null;
   }
 
-  // prices contains floorMon (MON), octaAmount (OCTA-equivalent) and craaAmount
   const { octaAmountWei, craPerOctaRate, craPerOctaRateScaled } = prices;
 
   const wallet = new ethers.Wallet(ORACLE_PK, provider);
-  const nonceManager = createNonceManager(wallet);
   const coreAbi = [
     'function setManualFloor(uint256 floor1e18) external',
     'function setCRARateManual(uint256 rate1e18) external'
   ];
   const core = new ethers.Contract(CORE_PROXY, coreAbi, wallet);
 
-  // The contract expects manualFloorPrice in OCTA (18 decimals) and CRA rate scaled 1e18.
   const floor1e18 = octaAmountWei;
   const craRate1e18 = craPerOctaRateScaled;
 
@@ -348,75 +398,32 @@ async function pushToContract(prices, dryRun = true) {
 
   if (dryRun) return null;
 
-  // helper: send tx with retry + exponential backoff and jitter
-  // NOTE: this runs for a single tx; to manage nonce collisions we compute
-  // a base nonce and pass explicit nonces for sequential transactions below.
-  async function sendWithRetry(fn, args = [], opts = {}, maxAttempts = 6) {
-    let attempt = 0;
-    let lastErr = null;
-    while (attempt < maxAttempts) {
-      try {
-        // small randomized delay prior to send to avoid thundering bursts
-        await sleep(randomDelay());
-        const tx = await fn(...args, opts);
-        console.log(`  Sent tx (attempt ${attempt+1}): ${tx.hash}`);
-        // wait for 1 confirmation (provider may be rate-limited when polling receipts)
-        try {
-          await provider.waitForTransaction(tx.hash, 1, 120000); // 2min timeout
-        } catch (waitErr) {
-          // provider.waitForTransaction can itself fail under rate limits; log and continue
-          console.warn(`  waitForTransaction warning: ${waitErr && waitErr.message ? waitErr.message : String(waitErr)}`);
-        }
-        return tx;
-      } catch (e) {
-        lastErr = e;
-        attempt += 1;
-        // exponential backoff with jitter
-        const base = Math.min(1000 * 2 ** attempt, 16000); // cap backoff
-        const jitter = Math.floor(Math.random() * 500);
-        const backoff = base + jitter;
-        // special handling/log for common provider errors
-        const emsg = (e && e.message) ? e.message : String(e);
-        if (emsg.includes('25/second request limit')) {
-          console.error(`  provider rate-limit hit: ${emsg}. backoff ${backoff}ms`);
-        } else if (emsg.includes('Another transaction has higher priority')) {
-          console.error(`  nonce/prio error: ${emsg}. backoff ${backoff}ms`);
-        } else {
-          console.error(`  tx attempt ${attempt} failed: ${emsg}. backoff ${backoff}ms`);
-        }
-        // record single error and continue
-        recordError();
-        await new Promise(r => setTimeout(r, backoff));
-      }
-    }
-    throw lastErr;
-  }
-
+  const queue = getOracleQueue();
   let txHash = null;
   let ok = true;
+
   try {
-  // Obtain a pending nonce from nonce manager and use explicit nonces for sequential txs
-  await nonceManager.init();
-  const n1 = await nonceManager.take();
-  const opts1 = Object.assign({}, { gasLimit: GAS_LIMIT, nonce: Number(n1) });
-  const tx1 = await sendWithRetry(core.setManualFloor.bind(core), [floor1e18], opts1);
-  txHash = tx1.hash;
-  // small delay before second tx to avoid burst limits
-  await new Promise(r => setTimeout(r, 1200));
+    const tx1 = await queue.enqueue(
+      async (nonce) => core.setManualFloor(floor1e18, { gasLimit: GAS_LIMIT, nonce }),
+      'setManualFloor'
+    );
+    txHash = tx1.hash;
+    await sleep(1200); // small delay before second tx
   } catch (e) {
     ok = false;
     console.error(`  ❌ Floor failed:`, e.message || e);
+    recordError();
   }
 
   try {
-    // use next nonce when sending CRAA rate tx
-    // if baseNonce not set above (floor failed before nonce fetch), fetch now
-    const n2 = await nonceManager.take();
-    const opts2 = Object.assign({}, { gasLimit: GAS_LIMIT, nonce: Number(n2) });
-    const tx2 = await sendWithRetry(core.setCRARateManual.bind(core), [craRate1e18], opts2);
+    await queue.enqueue(
+      async (nonce) => core.setCRARateManual(craRate1e18, { gasLimit: GAS_LIMIT, nonce }),
+      'setCRARateManual'
+    );
   } catch (e) {
     ok = false;
     console.error(`  ❌ CRAA failed:`, e.message || e);
+    recordError();
   }
 
   if (ok) {
@@ -434,7 +441,6 @@ async function smartPush(prices, dryRun = true) {
   const lastOcta = state.lastOctaAmount || 0;
   const now = Date.now();
 
-  // Rise → instant push
   const grewNow = (craaAmount > lastCraa * (1 + MIN_CHANGE_PCT)) || 
                   (octaAmount > lastOcta * (1 + MIN_CHANGE_PCT));
   
@@ -458,7 +464,6 @@ async function smartPush(prices, dryRun = true) {
     return { pushed: true, reason: 'rise' };
   }
 
-  // Fall → delay + stability check
   const lowerNow = (craaAmount < lastCraa * (1 - MIN_CHANGE_PCT)) || 
                    (octaAmount < lastOcta * (1 - MIN_CHANGE_PCT));
   
@@ -478,7 +483,6 @@ async function smartPush(prices, dryRun = true) {
       return { pushed: false, reason: 'pending_fall' };
     }
     
-    // Check stability
     const stableCraa = Math.abs(craaAmount - state.pendingCraa) / Math.max(state.pendingCraa, 1e-18) <= PENDING_TOL_PCT;
     const stableOcta = Math.abs(octaAmount - state.pendingOcta) / Math.max(state.pendingOcta, 1e-18) <= PENDING_TOL_PCT;
     
@@ -501,7 +505,6 @@ async function smartPush(prices, dryRun = true) {
       }
       return { pushed: true, reason: 'stable_fall' };
     } else {
-      // Force step-down with cap
       const targetCraa = Math.max(craaAmount, state.pendingCraa * (1 - MAX_STEP_DOWN_PCT));
       const targetOcta = Math.max(octaAmount, state.pendingOcta * (1 - MAX_STEP_DOWN_PCT));
       console.log(`\n⬇️ FORCED STEP-DOWN (max ${(MAX_STEP_DOWN_PCT*100).toFixed(0)}%)`);
@@ -529,7 +532,7 @@ async function smartPush(prices, dryRun = true) {
   return { pushed: false, reason: 'no_change' };
 }
 
-// ===== RANDOM TRADING =====
+// ===== RANDOM TRADING (using TxQueue) =====
 async function executeTrade(dryRun = true) {
   if (shouldStopForErrors()) {
     console.error('⛔ Skipping trading: recent errors triggered cooldown');
@@ -542,21 +545,20 @@ async function executeTrade(dryRun = true) {
   }
 
   const wallet = new ethers.Wallet(TRADER_PK, provider);
-  const nonceManager = createNonceManager(wallet);
+  const queue = getTraderQueue();
   const state = readState();
   const tradeState = state.trade || { 
     balance: 0, 
     craaBalance: 0, 
     octaBalance: 0,
-    lastAction: null  // 'buy' or 'sell'
+    lastAction: null
   };
   
-  // Ensure all fields exist (for backward compat)
   tradeState.balance = tradeState.balance || 0;
   tradeState.craaBalance = tradeState.craaBalance || 0;
   tradeState.octaBalance = tradeState.octaBalance || 0;
 
-  console.log(`\n💱 Trade (${wallet.address})`);
+  console.log(`\n💱 Trade (${await wallet.getAddress()})`);
   console.log(`  Balance: ${tradeState.balance.toFixed(6)} WMON, ${tradeState.craaBalance.toFixed(6)} CRAA, ${tradeState.octaBalance.toFixed(6)} OCTA`);
 
   const routerAbi = [
@@ -566,18 +568,16 @@ async function executeTrade(dryRun = true) {
   ];
   const router = new ethers.Contract(ROUTER, routerAbi, wallet);
 
-  // Alternate: if last was buy (or null) and we have balance → sell; else buy
   const shouldBuy = tradeState.lastAction !== 'buy' || (tradeState.craaBalance === 0 && tradeState.octaBalance === 0);
 
   if (shouldBuy) {
-    // BUY both CRAA and OCTA
-    const errors = [];
-    const successes = [];
     const buyPct = randomChoice(BUY_VARIANTS_PCT);
     const buyAmount = BASE_TRADE_MON * (buyPct / 100);
     const buyWei = ethers.parseEther(buyAmount.toFixed(18));
 
     console.log(`\n🛒 BUY ${buyPct}% of ${BASE_TRADE_MON} = ${buyAmount.toFixed(6)} MON (split CRAA + OCTA)`);
+
+    const errors = [];
 
     // Buy CRAA
     try {
@@ -588,27 +588,26 @@ async function executeTrade(dryRun = true) {
 
       if (!dryRun) {
         const deadline = Math.floor(Date.now() / 1000) + 300;
-        const nSwapCraa = await nonceManager.take();
-        const txCraa = await router.swapExactETHForTokens(minOutCraa, pathCraa, wallet.address, deadline, {
-          value: buyWei / 2n,
-          gasLimit: GAS_LIMIT,
-          nonce: Number(nSwapCraa)
-        });
-        console.log(`  CRAA Tx: ${txCraa.hash}`);
-        try { await txCraa.wait(); } catch (e) { console.warn('  swap wait warning:', e && e.message ? e.message : String(e)); }
+        const txCraa = await queue.enqueue(
+          async (nonce) => router.swapExactETHForTokens(minOutCraa, pathCraa, await wallet.getAddress(), deadline, {
+            value: buyWei / 2n,
+            gasLimit: GAS_LIMIT,
+            nonce
+          }),
+          'BUY CRAA'
+        );
         console.log(`  ✅ CRAA bought`);
-
         const boughtCraa = parseFloat(ethers.formatEther(amountsCraa[1]));
         tradeState.craaBalance += boughtCraa;
       } else {
         console.log(`  🔍 DRY RUN (CRAA)`);
       }
-      } catch (e) {
-        const msg = (e && e.message) ? e.message : String(e);
-        console.error(`  ❌ CRAA buy failed:`, msg);
-        errors.push(`CRAA buy failed: ${msg}`);
-        // do not abort; try OCTA buy as well
-      }
+    } catch (e) {
+      const msg = (e && e.message) ? e.message : String(e);
+      console.error(`  ❌ CRAA buy failed:`, msg);
+      errors.push(`CRAA buy failed: ${msg}`);
+      recordError();
+    }
 
     // Buy OCTA
     try {
@@ -619,16 +618,15 @@ async function executeTrade(dryRun = true) {
 
       if (!dryRun) {
         const deadline = Math.floor(Date.now() / 1000) + 300;
-        const nSwapOcta = await nonceManager.take();
-        const txOcta = await router.swapExactETHForTokens(minOutOcta, pathOcta, wallet.address, deadline, {
-          value: buyWei / 2n,
-          gasLimit: GAS_LIMIT,
-          nonce: Number(nSwapOcta)
-        });
-        console.log(`  OCTA Tx: ${txOcta.hash}`);
-        try { await txOcta.wait(); } catch (e) { console.warn('  swap wait warning:', e && e.message ? e.message : String(e)); }
+        const txOcta = await queue.enqueue(
+          async (nonce) => router.swapExactETHForTokens(minOutOcta, pathOcta, await wallet.getAddress(), deadline, {
+            value: buyWei / 2n,
+            gasLimit: GAS_LIMIT,
+            nonce
+          }),
+          'BUY OCTA'
+        );
         console.log(`  ✅ OCTA bought`);
-
         const boughtOcta = parseFloat(ethers.formatEther(amountsOcta[1]));
         tradeState.octaBalance += boughtOcta;
       } else {
@@ -638,11 +636,11 @@ async function executeTrade(dryRun = true) {
       const msg = (e && e.message) ? e.message : String(e);
       console.error(`  ❌ OCTA buy failed:`, msg);
       errors.push(`OCTA buy failed: ${msg}`);
+      recordError();
     }
-    // summarize buy results
+
     if (errors.length > 0) {
       console.error('\n⚠️ Trade completed with errors:', errors.join(' ; '));
-      recordError();
     } else {
       console.log('\n✅ Trade buy completed successfully');
       clearErrors();
@@ -664,23 +662,24 @@ async function executeTrade(dryRun = true) {
     const sellPct = randomChoice(SELL_VARIANTS_PCT);
     console.log(`\n💰 SELL ${sellPct}% of balances (CRAA + OCTA)`);
 
+    const sellErrors = [];
+
     // Sell CRAA
-  const sellErrors = [];
-  const sellSuccess = [];
-  if (tradeState.craaBalance > 0) {
+    if (tradeState.craaBalance > 0) {
       const sellCraa = tradeState.craaBalance * (sellPct / 100);
       if (sellCraa >= 0.001) {
         const sellWeiCraa = ethers.parseUnits(sellCraa.toFixed(18), 18);
         console.log(`  CRAA: ${sellCraa.toFixed(6)} CRAA`);
 
-  try {
+        try {
           const craaContract = new ethers.Contract(CRAA_TOKEN, ERC20Abi, wallet);
-          const allowance = await craaContract.allowance(wallet.address, ROUTER);
+          const allowance = await craaContract.allowance(await wallet.getAddress(), ROUTER);
           if (allowance < sellWeiCraa) {
             console.log('  Approving CRAA...');
-            const nApprove = await nonceManager.take();
-            const approveTx = await craaContract.approve(ROUTER, ethers.MaxUint256, { gasLimit: 100000, nonce: Number(nApprove) });
-            try { await approveTx.wait(); } catch (e) { console.warn('  approve wait warning:', e && e.message ? e.message : String(e)); }
+            await queue.enqueue(
+              async (nonce) => craaContract.approve(ROUTER, ethers.MaxUint256, { gasLimit: 100000, nonce }),
+              'APPROVE CRAA'
+            );
           }
 
           const pathCraa = [CRAA_TOKEN, WMON_TOKEN];
@@ -688,27 +687,28 @@ async function executeTrade(dryRun = true) {
           const minOutCraa = amountsCraa[1] * BigInt(10000 - TRADE_SLIPPAGE_BPS) / 10000n;
           console.log(`  CRAA expected: ${ethers.formatEther(amountsCraa[1])} WMON`);
 
-            if (!dryRun) {
+          if (!dryRun) {
             const deadline = Math.floor(Date.now() / 1000) + 300;
-            const nSwapCraa = await nonceManager.take();
-            const txCraa = await router.swapExactTokensForETH(sellWeiCraa, minOutCraa, pathCraa, wallet.address, deadline, {
-              gasLimit: GAS_LIMIT, nonce: Number(nSwapCraa)
-            });
-            console.log(`  CRAA Tx: ${txCraa.hash}`);
-            try { await txCraa.wait(); } catch (e) { console.warn('  swap wait warning:', e && e.message ? e.message : String(e)); }
+            await queue.enqueue(
+              async (nonce) => router.swapExactTokensForETH(sellWeiCraa, minOutCraa, pathCraa, await wallet.getAddress(), deadline, {
+                gasLimit: GAS_LIMIT,
+                nonce
+              }),
+              'SELL CRAA'
+            );
             console.log(`  ✅ CRAA sold`);
-
             const receivedMon = parseFloat(ethers.formatEther(amountsCraa[1]));
             tradeState.balance -= receivedMon;
             tradeState.craaBalance -= sellCraa;
           } else {
             console.log(`  🔍 DRY RUN (CRAA)`);
           }
-          } catch (e) {
-            const msg = (e && e.message) ? e.message : String(e);
-            console.error(`  ❌ CRAA sell failed:`, msg);
-            sellErrors.push(`CRAA sell failed: ${msg}`);
-          }
+        } catch (e) {
+          const msg = (e && e.message) ? e.message : String(e);
+          console.error(`  ❌ CRAA sell failed:`, msg);
+          sellErrors.push(`CRAA sell failed: ${msg}`);
+          recordError();
+        }
       } else {
         console.log(`  ⚠️  CRAA sell too small`);
       }
@@ -721,14 +721,15 @@ async function executeTrade(dryRun = true) {
         const sellWeiOcta = ethers.parseUnits(sellOcta.toFixed(18), 18);
         console.log(`  OCTA: ${sellOcta.toFixed(6)} OCTA`);
 
-  try {
+        try {
           const octaContract = new ethers.Contract(OCTA_TOKEN, ERC20Abi, wallet);
-          const allowance = await octaContract.allowance(wallet.address, ROUTER);
+          const allowance = await octaContract.allowance(await wallet.getAddress(), ROUTER);
           if (allowance < sellWeiOcta) {
             console.log('  Approving OCTA...');
-              const nApprove = await nonceManager.take();
-              const approveTx = await octaContract.approve(ROUTER, ethers.MaxUint256, { gasLimit: 100000, nonce: Number(nApprove) });
-              try { await approveTx.wait(); } catch (e) { console.warn('  approve wait warning:', e && e.message ? e.message : String(e)); }
+            await queue.enqueue(
+              async (nonce) => octaContract.approve(ROUTER, ethers.MaxUint256, { gasLimit: 100000, nonce }),
+              'APPROVE OCTA'
+            );
           }
 
           const pathOcta = [OCTA_TOKEN, WMON_TOKEN];
@@ -736,16 +737,16 @@ async function executeTrade(dryRun = true) {
           const minOutOcta = amountsOcta[1] * BigInt(10000 - TRADE_SLIPPAGE_BPS) / 10000n;
           console.log(`  OCTA expected: ${ethers.formatEther(amountsOcta[1])} WMON`);
 
-            if (!dryRun) {
+          if (!dryRun) {
             const deadline = Math.floor(Date.now() / 1000) + 300;
-            const nSwapOcta = await nonceManager.take();
-            const txOcta = await router.swapExactTokensForETH(sellWeiOcta, minOutOcta, pathOcta, wallet.address, deadline, {
-              gasLimit: GAS_LIMIT, nonce: Number(nSwapOcta)
-            });
-            console.log(`  OCTA Tx: ${txOcta.hash}`);
-            try { await txOcta.wait(); } catch (e) { console.warn('  swap wait warning:', e && e.message ? e.message : String(e)); }
+            await queue.enqueue(
+              async (nonce) => router.swapExactTokensForETH(sellWeiOcta, minOutOcta, pathOcta, await wallet.getAddress(), deadline, {
+                gasLimit: GAS_LIMIT,
+                nonce
+              }),
+              'SELL OCTA'
+            );
             console.log(`  ✅ OCTA sold`);
-
             const receivedMon = parseFloat(ethers.formatEther(amountsOcta[1]));
             tradeState.balance -= receivedMon;
             tradeState.octaBalance -= sellOcta;
@@ -756,16 +757,15 @@ async function executeTrade(dryRun = true) {
           const msg = (e && e.message) ? e.message : String(e);
           console.error(`  ❌ OCTA sell failed:`, msg);
           sellErrors.push(`OCTA sell failed: ${msg}`);
+          recordError();
         }
       } else {
         console.log(`  ⚠️  OCTA sell too small`);
       }
     }
 
-    // summarize sell results
     if (sellErrors.length > 0) {
       console.error('\n⚠️ Trade sell completed with errors:', sellErrors.join(' ; '));
-      recordError();
     } else {
       console.log('\n✅ Trade sell completed successfully');
       clearErrors();
@@ -778,7 +778,7 @@ async function executeTrade(dryRun = true) {
   }
 }
 
-// ===== MAIN =====
+// ===== MAIN (sequential, single execution) =====
 async function main() {
   if (shouldStopForErrors()) {
     console.error('⛔ Global stop: recent errors triggered cooldown. Exiting.');
@@ -794,11 +794,9 @@ async function main() {
 
   const prices = await fetchPrices();
 
-  // Use smartPush (anti-dump) logic instead of forcing push every run
   console.log('\n📤 Using smartPush (anti-dump) logic)');
   const smartRes = await smartPush(prices, dryRun);
 
-  // record pushed state
   const outPath = path.join(__dirname, '..', 'data', `bot_price_${NFT_COLLECTION}_${Date.now()}.json`);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   const snapshot = {
@@ -820,21 +818,14 @@ async function main() {
 
   console.log('\n✅ Done\n');
 }
-  if (require.main === module) {
-    main().catch(e => {
-      // Log full stack if available — Actions truncates single-line messages sometimes.
-      if (e && e.stack) {
-        console.error('\n\u274c Unhandled error:\n', e.stack);
-      } else {
-        console.error('\n\u274c', e && e.message ? e.message : String(e));
-      }
-      process.exit(1);
-    });
-  }
 
 if (require.main === module) {
   main().catch(e => {
-    console.error('\n❌', e.message);
+    if (e && e.stack) {
+      console.error('\n❌ Unhandled error:\n', e.stack);
+    } else {
+      console.error('\n❌', e && e.message ? e.message : String(e));
+    }
     process.exit(1);
   });
 }
