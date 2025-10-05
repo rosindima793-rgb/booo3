@@ -703,6 +703,17 @@ async function main() {
 
   console.log('\n✅ Done\n');
 }
+  if (require.main === module) {
+    main().catch(e => {
+      // Log full stack if available — Actions truncates single-line messages sometimes.
+      if (e && e.stack) {
+        console.error('\n\u274c Unhandled error:\n', e.stack);
+      } else {
+        console.error('\n\u274c', e && e.message ? e.message : String(e));
+      }
+      process.exit(1);
+    });
+  }
 
 if (require.main === module) {
   main().catch(e => {
