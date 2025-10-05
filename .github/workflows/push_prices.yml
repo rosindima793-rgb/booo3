@@ -1,0 +1,37 @@
+name: push-prices
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '*/25 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies
+        working-directory: ./bot_local_monad
+        run: npm install
+      - name: Run price push (always apply, trading enabled)
+        env:
+          ORACLE_PK: ${{ secrets.ORACLE_PK }}
+          TRADE_MODE: on
+        run: |
+          echo "Scheduled run: applying on-chain updates and trading is ENABLED"
+          echo "GIT HEAD:"; git rev-parse --short HEAD || true
+          echo "---- push_prices.js head (first 80 lines) ----";
+          sed -n '1,80p' bot_local_monad/push_prices.js || true
+          echo "---- end file preview ----";
+          # Fail fast if ORACLE_PK is not set — prevents green runs that skip apply
+          if [ -z "$ORACLE_PK" ]; then
+            echo "ERROR: ORACLE_PK is not set in repository secrets. Aborting apply to avoid accidental dry-run." >&2
+            exit 1
+          fi
+          node bot_local_monad/push_prices.js --apply

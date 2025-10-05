@@ -1,0 +1,20 @@
+# Ignore local environment files and secrets
+.env
+.env.local
+
+# Node modules
+node_modules/
+
+# NPM logs
+npm-debug.log*
+
+# Bot runtime state and snapshots
+bot_local_monad/bot_state.json
+bot_local_monad/bot_price_*.json
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+
+# History / backup folders
+.history/

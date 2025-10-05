@@ -1,0 +1,7 @@
+{
+  "name": "bot-local-monad",
+  "version": "0.1.0",
+  "main": "smart-runner.js",
+  "scripts": { "start": "node smart-runner.js" },
+  "dependencies": { "axios": "^1.7.7", "dotenv": "^16.4.5", "ethers": "^6.13.4" }
+}
