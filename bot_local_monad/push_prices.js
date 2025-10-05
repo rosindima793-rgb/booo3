@@ -58,6 +58,22 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const statePath = path.join(__dirname, '..', 'data', 'bot_state.json');
 const errPath = path.join(__dirname, '..', 'data', 'error_state.json');
 
+// Simple retry helper with exponential backoff
+async function retryAsync(fn, attempts = 3, baseDelay = 500) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const backoff = baseDelay * 2 ** i;
+      console.warn(`Retry ${i + 1}/${attempts} failed: ${e && e.message ? e.message : String(e)} - backoff ${backoff}ms`);
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, backoff));
+    }
+  }
+  throw lastErr;
+}
+
 function isValidAddress(a){ return typeof a === 'string' && /^0x[a-fA-F0-9]{40}$/.test(a); }
 function randomChoice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
@@ -120,19 +136,41 @@ async function findPancakePair(tokenAddr) {
   if (!PANCAKE_FACTORY || !WMON_TOKEN) throw new Error('PANCAKE_FACTORY or WMON_TOKEN missing');
   const factoryAbi = ['function getPair(address,address) view returns (address)'];
   const factory = new ethers.Contract(PANCAKE_FACTORY, factoryAbi, provider);
-  const pair = await factory.getPair(tokenAddr, WMON_TOKEN);
+  const rawPair = await retryAsync(() => factory.getPair(tokenAddr, WMON_TOKEN));
   const zero = '0x0000000000000000000000000000000000000000';
-  if (!pair || pair.toLowerCase() === zero) {
+  if (!rawPair || rawPair.toLowerCase() === zero) {
     if (tokenAddr === CRAA_TOKEN && CRAA_WMON_POOL) return CRAA_WMON_POOL;
     if (tokenAddr === OCTA_TOKEN && OCTA_WMON_POOL) return OCTA_WMON_POOL;
     throw new Error(`No pair for ${tokenAddr}`);
   }
-  return pair.toLowerCase();
+
+  const pair = rawPair.toLowerCase();
+  // Validate that the pair address actually implements expected pair methods.
+  try {
+    console.log(`Factory returned pair address for token ${tokenAddr}: ${pair}`);
+  const code = await retryAsync(() => provider.getCode(pair));
+    console.log(`Pair code size (hex): ${code.length} for ${pair}`);
+    if (!code || code === '0x') {
+      throw new Error(`No contract code at pair address ${pair}`);
+    }
+    const pairContract = new ethers.Contract(pair, ['function token0() view returns (address)'], provider);
+    // call token0() to confirm the contract behaves like a UniswapV2 pair
+  await retryAsync(() => pairContract.token0());
+    return pair;
+  } catch (err) {
+    // invalid pair address / non-pair contract — log and try fallback pools
+    console.error(`Pair at ${pair} failed token0() call:`, err?.message ?? String(err));
+    if (tokenAddr === CRAA_TOKEN && CRAA_WMON_POOL) return CRAA_WMON_POOL;
+    if (tokenAddr === OCTA_TOKEN && OCTA_WMON_POOL) return OCTA_WMON_POOL;
+    throw new Error(`Pair at ${pair} is not a valid Pancake pair: ${err?.message ?? String(err)}`);
+  }
 }
 
 async function priceTokenInMON(pairAddr, tokenAddr) {
   const pair = new ethers.Contract(pairAddr, PairAbi, provider);
-  const [t0, t1, reserves] = await Promise.all([pair.token0(), pair.token1(), pair.getReserves()]);
+  const t0 = await retryAsync(() => pair.token0());
+  const t1 = await retryAsync(() => pair.token1());
+  const reserves = await retryAsync(() => pair.getReserves());
   const [r0, r1] = reserves;
   const token0 = t0.toLowerCase();
   const token1 = t1.toLowerCase();
@@ -174,12 +212,12 @@ async function priceTokenInMON(pairAddr, tokenAddr) {
 async function fetchFloorMON() {
   const url = `${RES_BASE}/stats/v2?collection=${NFT_COLLECTION}`;
   try {
-    const { data } = await axios.get(url, { timeout: 15000 });
+    const { data } = await retryAsync(() => axios.get(url, { timeout: 15000 }));
     const native = data?.stats?.market?.floorAsk?.value?.native || data?.stats?.floor?.native;
     if (native && typeof native === 'number') return native;
   } catch (e) { /* ignore */ }
   const url2 = `${RES_BASE}/tokens/floor/v1?contract=${NFT_COLLECTION}&limit=100`;
-  const { data: d2 } = await axios.get(url2, { timeout: 15000 });
+  const { data: d2 } = await retryAsync(() => axios.get(url2, { timeout: 15000 }));
   const rawTokens = d2?.tokens;
   let prices = [];
   if (Array.isArray(rawTokens)) {
