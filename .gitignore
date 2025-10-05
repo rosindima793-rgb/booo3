@@ -18,3 +18,7 @@ Thumbs.db
 
 # History / backup folders
 .history/
+
+# runtime snapshots
+data/
+
