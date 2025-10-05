@@ -1,0 +1,15 @@
+{
+  "ts": "2025-10-05T11:32:06.703Z",
+  "floorMon": 0.3,
+  "floorMonWei": "300000000000000000",
+  "craaAmount": 1229601833.435574,
+  "craaAmountWei": "1229601833435574077811067702",
+  "octaAmount": 6015471891.738208,
+  "octaAmountWei": "6015471891738207753400615995",
+  "craPerOctaRate": 0.20440654624691015,
+  "craPerOctaRateScaled": "204406546246910154",
+  "pushed": {
+    "pushed": true,
+    "reason": "rise"
+  }
+}
