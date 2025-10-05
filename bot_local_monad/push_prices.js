@@ -74,6 +74,13 @@ async function retryAsync(fn, attempts = 3, baseDelay = 500) {
   throw lastErr;
 }
 
+// Rate limiting: randomized small delay between external calls to avoid RPC throttling
+const RATE_LIMIT_MIN_MS = parseInt(process.env.RATE_LIMIT_MIN_MS || '100', 10);
+const RATE_LIMIT_MAX_MS = parseInt(process.env.RATE_LIMIT_MAX_MS || '300', 10);
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function randomDelay() { return Math.floor(Math.random() * (Math.max(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS) - Math.min(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS) + 1)) + Math.min(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS); }
+
+
 function isValidAddress(a){ return typeof a === 'string' && /^0x[a-fA-F0-9]{40}$/.test(a); }
 function randomChoice(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
@@ -136,6 +143,7 @@ async function findPancakePair(tokenAddr) {
   if (!PANCAKE_FACTORY || !WMON_TOKEN) throw new Error('PANCAKE_FACTORY or WMON_TOKEN missing');
   const factoryAbi = ['function getPair(address,address) view returns (address)'];
   const factory = new ethers.Contract(PANCAKE_FACTORY, factoryAbi, provider);
+  await sleep(randomDelay());
   const rawPair = await retryAsync(() => factory.getPair(tokenAddr, WMON_TOKEN));
   const zero = '0x0000000000000000000000000000000000000000';
   if (!rawPair || rawPair.toLowerCase() === zero) {
@@ -148,6 +156,7 @@ async function findPancakePair(tokenAddr) {
   // Validate that the pair address actually implements expected pair methods.
   try {
     console.log(`Factory returned pair address for token ${tokenAddr}: ${pair}`);
+  await sleep(randomDelay());
   const code = await retryAsync(() => provider.getCode(pair));
     console.log(`Pair code size (hex): ${code.length} for ${pair}`);
     if (!code || code === '0x') {
@@ -155,6 +164,7 @@ async function findPancakePair(tokenAddr) {
     }
     const pairContract = new ethers.Contract(pair, ['function token0() view returns (address)'], provider);
     // call token0() to confirm the contract behaves like a UniswapV2 pair
+  await sleep(randomDelay());
   await retryAsync(() => pairContract.token0());
     return pair;
   } catch (err) {
@@ -168,8 +178,11 @@ async function findPancakePair(tokenAddr) {
 
 async function priceTokenInMON(pairAddr, tokenAddr) {
   const pair = new ethers.Contract(pairAddr, PairAbi, provider);
+  await sleep(randomDelay());
   const t0 = await retryAsync(() => pair.token0());
+  await sleep(randomDelay());
   const t1 = await retryAsync(() => pair.token1());
+  await sleep(randomDelay());
   const reserves = await retryAsync(() => pair.getReserves());
   const [r0, r1] = reserves;
   const token0 = t0.toLowerCase();
@@ -212,11 +225,13 @@ async function priceTokenInMON(pairAddr, tokenAddr) {
 async function fetchFloorMON() {
   const url = `${RES_BASE}/stats/v2?collection=${NFT_COLLECTION}`;
   try {
-    const { data } = await retryAsync(() => axios.get(url, { timeout: 15000 }));
+  await sleep(randomDelay());
+  const { data } = await retryAsync(() => axios.get(url, { timeout: 15000 }));
     const native = data?.stats?.market?.floorAsk?.value?.native || data?.stats?.floor?.native;
     if (native && typeof native === 'number') return native;
   } catch (e) { /* ignore */ }
   const url2 = `${RES_BASE}/tokens/floor/v1?contract=${NFT_COLLECTION}&limit=100`;
+  await sleep(randomDelay());
   const { data: d2 } = await retryAsync(() => axios.get(url2, { timeout: 15000 }));
   const rawTokens = d2?.tokens;
   let prices = [];
